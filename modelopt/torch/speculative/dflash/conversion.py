@@ -47,6 +47,7 @@ DFlash2DMRegistry = _DMRegistryCls(prefix="DFlash2")
 # ``dflash_architecture_config.projector_type == "lilicorr"`` and kept in its own
 # registry so its wrapper (HFLiLiCorrModel) does not overwrite HFDFlashModel.
 LiLiCorrDMRegistry = _DMRegistryCls(prefix="LiLiCorr")
+JetSpecDMRegistry = _DMRegistryCls(prefix="JetSpec")
 
 # dflash_architecture_config.projector_type -> the registry holding that variant's wrapper.
 _REGISTRY_BY_PROJECTOR_TYPE = {
@@ -56,6 +57,7 @@ _REGISTRY_BY_PROJECTOR_TYPE = {
     "dspark": DSparkDMRegistry,
     "dflash2": DFlash2DMRegistry,
     "lilicorr": LiLiCorrDMRegistry,
+    "jetspec": JetSpecDMRegistry,
 }
 
 

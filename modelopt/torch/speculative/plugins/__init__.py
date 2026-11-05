@@ -36,5 +36,6 @@ with import_plugin("transformers"):
     from .hf_dspark import *
     from .hf_eagle import *
     from .hf_external import *
+    from .hf_jetspec import *
     from .hf_lilicorr import *
     from .hf_medusa import *

@@ -508,6 +508,24 @@ class DFlashExporter(SpeculativeDecodingExporter):
         )
 
 
+class JetSpecExporter(DFlashExporter):
+    """Export the independently trained JetSpec drafter or tap-space adapter."""
+
+    def _export_config(self):
+        if self.model.jetspec_stage == "adapter":
+            return {
+                "architectures": ["JetSpecAdapter"],
+                "model_type": "jetspec_adapter",
+                "text_config": self.model._base_llm_config.to_dict(),
+                "target_layer_ids": list(self.model.target_layer_ids),
+                "adapter_depths": self.model.dflash_module.depths,
+                "block_size": self.model.dflash_block_size,
+            }
+        config = super()._export_config()
+        config["dflash_config"].update(jacobi_forcing=True, noise_source="context")
+        return config
+
+
 class DominoExporter(DFlashExporter):
     """Draft model exporter for Domino (DFlash backbone + causal correction head).
 
