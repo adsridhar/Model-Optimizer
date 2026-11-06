@@ -489,6 +489,11 @@ class ExternalDraftConfig(ModeloptBaseConfig):
     hidden states, projected by the base lm_head to obtain teacher logits.
     """
 
+    external_freeze_vision_encoder: bool = ModeloptField(
+        default=False,
+        description="Freeze Qwen3.5's vision encoder while keeping its merger trainable.",
+    )
+
     external_loss: Literal["soft_ce", "tvd", "tvd_deploy", "tvd_ce"] = ModeloptField(
         default="tvd",
         description=(

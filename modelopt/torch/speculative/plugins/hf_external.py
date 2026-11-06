@@ -17,8 +17,8 @@
 
 Unlike Eagle/Medusa/DFlash, the draft here is an ordinary pretrained causal LM
 that owns its embeddings and lm_head. The base model is not modified and nothing
-is grafted onto it: it contributes only per-token hidden states, which are
-projected by the base lm_head to obtain teacher logits.
+is grafted onto it. Supervision comes from sparse teacher policies, computed offline
+or online, or from cached hidden states projected by the base lm_head.
 
 ``external_loss`` selects the objective: ``soft_ce`` matches the Eagle offline
 objective, ``tvd`` is total-variation distance between the two distributions,
@@ -66,7 +66,25 @@ class HFExternalDraftModel(ExternalDraftModel):
 
     def modify(self, config):
         """Configure the draft and validate that it can score against this base."""
+        if config.external_freeze_vision_encoder and self.config.model_type != "qwen3_5":
+            raise ValueError(
+                "Freezing the external vision encoder currently supports Qwen3.5 only."
+            )
         super().modify(config)
+        if self.config.model_type == "qwen3_5":
+            self.model.visual.requires_grad_(not config.external_freeze_vision_encoder)
+            self.model.visual.merger.requires_grad_(True)
+            self.model.visual.train(self.training and not config.external_freeze_vision_encoder)
+            self.model.visual.merger.train(self.training)
+        self._external_freeze_vision_encoder = config.external_freeze_vision_encoder
+
+    def train(self, mode=True):
+        """Keep the frozen encoder in eval mode while the merger follows the trainer."""
+        super().train(mode)
+        if getattr(self, "_external_freeze_vision_encoder", False):
+            self.model.visual.eval()
+            self.model.visual.merger.train(mode)
+        return self
 
     def attach_base_lm_head(self, base_lm_head, base_final_norm=None, device=None) -> None:
         """Attach the base lm_head used to project cached hidden states to teacher logits.
@@ -133,9 +151,10 @@ class HFExternalDraftModel(ExternalDraftModel):
         base_model_outputs=None,
         teacher_topk_tok=None,
         teacher_topk_prob=None,
+        response_positions=None,
         **kwargs,
     ):
-        """Score the draft against cached base hidden states.
+        """Score the draft against sparse policies or cached base hidden states.
 
         Only ``base_model_hidden_states`` is consumed; ``aux_hidden_states`` exists in the
         dump for the head-based modes and is not used here.
@@ -143,9 +162,23 @@ class HFExternalDraftModel(ExternalDraftModel):
         sparse = teacher_topk_tok is not None
         if not sparse and base_model_outputs is None:
             raise ValueError(
-                "External draft training expects offline base_model_outputs in the batch; "
-                "online training against a live base model is not supported."
+                "External draft training requires offline base_model_outputs or "
+                "teacher_topk_tok/teacher_topk_prob. Configure the online trainer to "
+                "supply live teacher policies."
             )
+        aligned = sparse and self.config.model_type == "qwen3_5"
+        if aligned:
+            if loss_mask is None or response_positions is None:
+                raise ValueError("Qwen3.5 sparse training requires a response mask and positions.")
+            positions = response_positions
+            if positions.numel() == 0:
+                raise ValueError("Each response needs scored tokens and a preceding prompt.")
+            # Avoid materializing vocabulary logits for visual tokens and the prompt.
+            kwargs["logits_to_keep"] = positions - 1
+            kwargs["use_cache"] = False
+            teacher_topk_tok = teacher_topk_tok[:, positions]
+            teacher_topk_prob = teacher_topk_prob[:, positions]
+            loss_mask = loss_mask[:, positions]
         draft_out = super().forward(input_ids=input_ids, attention_mask=attention_mask, **kwargs)
         if loss_mask is None:
             # Derive from attention_mask so padding is not trained on, matching the
@@ -159,7 +192,7 @@ class HFExternalDraftModel(ExternalDraftModel):
             ).to(draft_out.logits.dtype)
         if sparse:
             loss, acc = self.compute_sparse_loss(
-                draft_out.logits, teacher_topk_tok, teacher_topk_prob, loss_mask
+                draft_out.logits, teacher_topk_tok, teacher_topk_prob, loss_mask, aligned=aligned
             )
         else:
             base_logits = self._teacher_logits(
@@ -231,7 +264,7 @@ class HFExternalDraftModel(ExternalDraftModel):
         A mismatch cannot be caught downstream: training would optimise against
         misaligned columns and yield a plausible loss curve with no acceptance.
         """
-        draft_vocab_size = int(self.config.vocab_size)
+        draft_vocab_size = int(self.config.get_text_config().vocab_size)
         if draft_vocab_size != int(base_vocab_size):
             raise ValueError(
                 "External draft and base model must share a vocabulary: draft "
@@ -342,7 +375,7 @@ class HFExternalDraftModel(ExternalDraftModel):
         outside = (1.0 - q.sum(-1)).clamp_min(0.0)
         return 0.5 * ((p - q).abs().sum(-1) + outside)
 
-    def compute_sparse_loss(self, draft_logits, topk_tok, topk_prob, loss_mask):
+    def compute_sparse_loss(self, draft_logits, topk_tok, topk_prob, loss_mask, aligned=False):
         """``tvd`` against a sparse teacher policy; returns ``(loss, accuracy)``.
 
         The sparse policy is indexed by the token it produced: position ``t`` holds the
@@ -350,11 +383,16 @@ class HFExternalDraftModel(ExternalDraftModel):
         draft's logits at ``t`` are conditioned on ``<= t`` and predict ``t + 1``, so the
         draft is shifted one position left before the two are compared. Dropping the shift
         still yields a falling loss curve -- it just trains against the wrong target.
+        ``aligned`` skips that shift when the multimodal forward already selected predictors.
         """
+        if not aligned:
+            draft_logits = draft_logits[:, :-1]
+            topk_tok, topk_prob = topk_tok[:, 1:], topk_prob[:, 1:]
+            loss_mask = loss_mask[:, 1:]
         seq = min(draft_logits.shape[1], topk_tok.shape[1])
-        draft = draft_logits[:, : seq - 1]
-        tok, prob = topk_tok[:, 1:seq], topk_prob[:, 1:seq]
-        mask = loss_mask[:, 1:seq].to(draft_logits.dtype)
+        draft = draft_logits[:, :seq]
+        tok, prob = topk_tok[:, :seq], topk_prob[:, :seq]
+        mask = loss_mask[:, :seq].to(draft_logits.dtype)
         denom = mask.sum() + 1e-5
         loss = (self._tvd_sparse(draft, tok, prob) * mask).sum() / denom
         # A row the dump left empty has no teacher top-1: its argmax is slot 0, i.e.

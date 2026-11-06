@@ -1,0 +1,36 @@
+# modelopt-schema: modelopt.recipe.config.ModelOptExternalDraftRecipe
+metadata:
+  description: Offline Cosmos3 Super policies with a vision-capable Qwen3.5-0.8B draft.
+model:
+  model_name_or_path: ../models/cosmos3-super-reasoner_vbf16-final
+  use_fake_base_for_offline: true
+draft_model_name_or_path: Qwen/Qwen3.5-0.8B
+data:
+  sparse_data_path: ../../scratch.adsridhar_other_1/external_draft/cosmos3/policy
+  sparse_cache_dir: ../../scratch.adsridhar_other_1/external_draft/cosmos3/cache
+  vlm_processor: Qwen/Qwen3.5-0.8B
+training:
+  output_dir: ckpts/cosmos3-super-qwen35-external-stage1
+  training_seq_len: 16384
+  per_device_train_batch_size: 2
+  gradient_accumulation_steps: 2
+  gradient_checkpointing: true
+  gradient_checkpointing_kwargs:
+    use_reentrant: false
+  dp_shard_size: 1
+  ddp_find_unused_parameters: true
+  learning_rate: 2.0e-5
+  num_train_epochs: 1
+  warmup_steps: 250
+  max_grad_norm: 1.0
+  bf16: true
+  remove_unused_columns: false
+  answer_only_loss: true
+  estimate_ar: false
+  ar_validate_steps: -1
+external:
+  external_loss: tvd
+  external_vocab_swap: true
+  external_freeze_vision_encoder: true
+  external_top_k: 20
+  external_top_p: 0.95

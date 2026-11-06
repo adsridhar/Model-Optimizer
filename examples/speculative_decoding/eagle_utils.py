@@ -32,6 +32,7 @@ from modelopt.torch.speculative.eagle.utils import (
     EagleOfflineDataCollator,
     OfflineSupervisedDataset,
 )
+from modelopt.torch.speculative.external.multimodal import MultimodalSparsePolicyCollator
 from modelopt.torch.speculative.plugins.master_weight_adamw import MasterWeightAdamW
 from modelopt.torch.speculative.utils import get_ttt_msk_func
 from modelopt.torch.utils import print_rank_0
@@ -176,7 +177,6 @@ def make_speculative_data_module(
         )
 
         print_rank_0("Loading sparse teacher-policy data for external draft training...")
-        assert not data_args.vlm_processor, "Sparse data is not supported for VLM."
         # Shared with the pre-build instructions: a hand-built cache is only reused if it
         # was keyed on the same shard list, so discovery lives in one place.
         files = discover_shards(data_args.sparse_data_path)
@@ -195,7 +195,16 @@ def make_speculative_data_module(
         )
         if data_args.sparse_source_weights:
             print_rank_0(f"[sparse] source weights applied: {data_args.sparse_source_weights}")
-        data_collator = SparsePolicyCollator(train_len=train_len)
+        if train_dataset.multimodal != bool(data_args.vlm_processor):
+            raise ValueError(
+                "Multimodal policies require data.vlm_processor; text policies do not."
+            )
+        if data_args.vlm_processor:
+            data_collator = MultimodalSparsePolicyCollator(
+                data_args.vlm_processor, tokenizer, train_len, chat_template=chat_template
+            )
+        else:
+            data_collator = SparsePolicyCollator(train_len=train_len)
 
     else:
         print_rank_0("Loading pre-processed data for offline training...")
@@ -322,7 +331,7 @@ class EagleTrainerWithAccLog(Trainer):
                 self.optimizer.param_groups = new_groups
         return self.optimizer
 
-    def compute_loss(self, *args, **kwargs):
+    def compute_loss(self, *args, return_outputs=False, **kwargs):
         """Override compute_loss to save train accs and per-component losses in trainer state."""
         if not hasattr(self.state, "training_accs"):
             self.state.training_accs = []
@@ -340,7 +349,7 @@ class EagleTrainerWithAccLog(Trainer):
             val = getattr(outputs, attr, None)
             if val is not None:
                 self.state.component_losses[key].append(val.item())
-        return loss
+        return (loss, outputs) if return_outputs else loss
 
 
 class LoRAWarmupCallback(TrainerCallback):

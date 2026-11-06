@@ -31,7 +31,10 @@
 
 import argparse
 import dataclasses
+import hashlib
+import json
 import os
+from pathlib import Path
 
 import fsdp2_buffer_patch
 import torch
@@ -43,6 +46,11 @@ from eagle_utils import (
     LoRAWarmupCallback,
     make_speculative_data_module,
     patch_ring_attention_for_ttt,
+)
+from external_online import (
+    OnlineConversationDataset,
+    OnlineExternalDraftTrainer,
+    OnlineMultimodalCollator,
 )
 from rich.pretty import pprint
 from transformers.trainer_utils import get_last_checkpoint
@@ -59,6 +67,7 @@ from modelopt.recipe.config import (
 )
 from modelopt.torch.opt.conversion import ModeloptStateManager, modelopt_state
 from modelopt.torch.speculative.config import ExternalDraftConfig
+from modelopt.torch.speculative.external.multimodal import retarget_visual_tokens
 from modelopt.torch.speculative.external.vocab_swap import swap_draft_vocabulary
 from modelopt.torch.speculative.plugins.hf_dflash import HFDFlashModel
 from modelopt.torch.speculative.plugins.hf_domino import DominoLambdaCallback
@@ -198,7 +207,7 @@ def setup_external_draft(
     already converted -- the validations and the head attachment below still run.
 
     Args:
-        base_model: the target, kept only for its lm_head and vocabulary.
+        base_model: the target, used for its vocabulary and offline lm_head.
         draft: the already-loaded draft on the resume path; loaded here when None.
         dry_run: recipe validation only; skips the data-source requirement, as the
             ``data.data_path`` check in :func:`train` does.
@@ -209,18 +218,9 @@ def setup_external_draft(
         raise ValueError(
             "draft_model_name_or_path must be set in the recipe YAML or via a dotlist override."
         )
-    # Checked here, not on the recipe schema: the loader validates the recipe file once
-    # before splicing CLI overrides, so a schema-level raise would make it impossible to
-    # pass the data path on the command line -- the shipped recipe carries none.
-    # Only "online" is rejected: it is the one mode that produces no cached base
-    # outputs at all. "streaming" feeds the same pre-computed hidden states offline
-    # does, so it is permitted but untested for this mode -- if its batches ever lack
-    # base_model_outputs the forward raises rather than training on nothing.
-    if not dry_run and recipe.data.mode == "online":
+    if not dry_run and recipe.data.mode == "online" and not recipe.data.vlm_processor:
         raise ValueError(
-            "external draft training has no online path: the draft is scored against "
-            "cached base outputs, which an online run does not produce. Set "
-            "data.offline_data_path."
+            "Online external drafts currently require the Cosmos3/Qwen3.5 multimodal pair."
         )
     if training_args.cp_size > 1:
         raise ValueError(
@@ -228,14 +228,29 @@ def setup_external_draft(
             "standalone model scored against cached base outputs, and nothing in this mode "
             f"shards the sequence. Got cp_size={training_args.cp_size}; set it to 1."
         )
-    base_vocab_size = base_model.config.vocab_size
+    base_vocab_size = getattr(base_model.config, "text_config", base_model.config).vocab_size
     if draft is None:
-        draft = transformers.AutoModelForCausalLM.from_pretrained(
+        loader = (
+            load_vlm_or_llm
+            if recipe.data.vlm_processor
+            else transformers.AutoModelForCausalLM.from_pretrained
+        )
+        draft = loader(
             recipe.draft_model_name_or_path,
             dtype="auto",
             device_map="cpu",
             trust_remote_code=recipe.model.trust_remote_code,
         )
+    if recipe.data.vlm_processor:
+        if draft.config.model_type != "qwen3_5" or recipe.data.mode not in ("sparse", "online"):
+            raise ValueError(
+                "Multimodal external drafts require Qwen3.5 and sparse or online policies."
+            )
+        if training_args.fsdp or training_args.deepspeed or training_args.dp_shard_size != 1:
+            raise ValueError(
+                "Multimodal external drafts currently require DDP with training.dp_shard_size=1; "
+                "sharded visual modules can issue different collectives for mixed modalities."
+            )
     external_cfg: dict = recipe.external.model_dump()
     # The draft's own tokenizer, needed before conversion if its vocabulary has to be
     # re-indexed onto the base's.
@@ -269,12 +284,17 @@ def setup_external_draft(
         # The draft's rows are indexed by the base vocabulary from here on, so train and
         # validate it against the base tokenizer.
         tokenizer = base_tokenizer
+    if recipe.data.vlm_processor:
+        retarget_visual_tokens(draft.config, tokenizer)
     # Sparse data carries only the teacher's truncated policy. Objectives that need full
     # teacher logits would silently train against a zero-padded distribution, so gate on
     # the list the plugin exports.
-    if recipe.data.mode == "sparse" and external_cfg["external_loss"] not in SPARSE_CAPABLE_LOSSES:
+    if (
+        recipe.data.mode in ("sparse", "online")
+        and external_cfg["external_loss"] not in SPARSE_CAPABLE_LOSSES
+    ):
         raise ValueError(
-            f"data.sparse_data_path requires external.external_loss in "
+            f"Sparse/online policies require external.external_loss in "
             f"{list(SPARSE_CAPABLE_LOSSES)}, got {external_cfg['external_loss']!r}."
         )
     restored_modes = {m for m, _ in modelopt_state(draft)["modelopt_state_dict"]}
@@ -308,7 +328,7 @@ def setup_external_draft(
     # The sparse path carries the teacher's policy in the data, so the base lm_head is
     # dead weight on the GPU; the base is still loaded for the vocabulary check, which is
     # cheap under use_fake_base_for_offline.
-    if recipe.data.mode != "sparse":
+    if recipe.data.mode not in ("sparse", "online"):
         norm_path = find_final_norm_path(base_model)
         base_final_norm = base_model.get_submodule(norm_path) if norm_path else None
         # Attach on the device training will run on: the draft is loaded with
@@ -361,14 +381,14 @@ def train():
 
     checkpoint = training_args.resume_from_checkpoint or last_checkpoint
 
+    online_external = (
+        isinstance(recipe, ModelOptExternalDraftRecipe)
+        and recipe.data.mode == "online"
+        and not dry_run
+    )
+    online_teacher = None
     use_offline_training = recipe.data.mode != "online"
-    if isinstance(recipe, ModelOptExternalDraftRecipe):
-        # This mode has no online path (see setup_external_draft), and the shipped recipe
-        # carries no data-source field, so mode resolves to "online" under --dry_run.
-        # Deriving the flag from it there would make load_vlm_or_llm ignore
-        # use_fake_base_for_offline and materialise every base decoder layer on every
-        # rank, and would route a VLM base to the real multimodal model, whose parent
-        # config has no vocab_size for validate_against_base to read.
+    if isinstance(recipe, ModelOptExternalDraftRecipe) and dry_run:
         use_offline_training = True
 
     # Resume path depends on the existing checkpoint's on-disk format: consolidated HF
@@ -389,17 +409,12 @@ def train():
             checkpoint, trust_remote_code=recipe.model.trust_remote_code
         )
         if isinstance(recipe, ModelOptExternalDraftRecipe):
-            # The restored draft is already converted (the checkpoint carries
-            # modelopt_state.pth), but the base lm_head it is scored against is not part
-            # of its state, so it still has to be re-attached. The base is not on this
-            # path at all, so load it here; use_fake_base_for_offline keeps that cheap.
+            # Reload the teacher separately: it is never part of a draft checkpoint.
             if recipe.model.model_name_or_path is None:
                 raise ValueError(
                     "model.model_name_or_path must be set to resume an external-draft run: "
                     "the base model supplies the lm_head the draft is scored against."
                 )
-            # Same arguments as the fresh path below; use_offline_training is pinned
-            # True for this recipe above.
             base_model = load_vlm_or_llm(
                 recipe.model.model_name_or_path,
                 use_fake_base=recipe.model.use_fake_base_for_offline,
@@ -409,6 +424,8 @@ def train():
                 trust_remote_code=recipe.model.trust_remote_code,
                 config_overrides=recipe.model.config_overrides,
             )
+            if online_external:
+                online_teacher = base_model
             model, tokenizer = setup_external_draft(
                 recipe, training_args, base_model=base_model, draft=model, dry_run=dry_run
             )
@@ -459,6 +476,8 @@ def train():
             dflash_cfg: dict = recipe.dflash.model_dump()
             mtsp.convert(model, [("dflash", dflash_cfg)])
         elif isinstance(recipe, ModelOptExternalDraftRecipe):
+            if online_external:
+                online_teacher = model
             # This mode inverts the usual relationship: we train a pretrained draft, and
             # `model` loaded above is the base, kept only for its lm_head and vocabulary.
             model, tokenizer = setup_external_draft(
@@ -502,18 +521,65 @@ def train():
             f"data.sparse_data_path is only supported by the external draft recipe; "
             f"{type(recipe).__name__} cannot consume a sparse teacher policy."
         )
-    data_module = make_speculative_data_module(
-        tokenizer,
-        recipe.data,
-        train_len=training_args.training_seq_len,
-        answer_only_loss=training_args.answer_only_loss,
-        shift_labels=not is_dflash,
-        final_aux_is_base_hidden=recipe.data.final_aux_is_base_hidden,
-        # The external draft never reads the aux planes, so it can consume dumps
-        # written with --no-aux-hidden-states. Every other mode must still fail
-        # loudly on a dump that omits them.
-        aux_hidden_states_optional=isinstance(recipe, ModelOptExternalDraftRecipe),
-    )
+    if online_external:
+        if online_teacher.config.model_type != "qwen3_vl":
+            raise ValueError("Online external drafts currently require a Cosmos3 Super teacher.")
+        if not training_args.answer_only_loss:
+            raise ValueError("Online external drafts require training.answer_only_loss=true.")
+        dataset = OnlineConversationDataset(recipe.data.data_path, recipe.data.sample_size)
+        fingerprint = {
+            "dataset": dataset.fingerprint,
+            "teacher": recipe.model.model_name_or_path,
+            "teacher_config": hashlib.sha256(
+                online_teacher.config.to_json_string().encode()
+            ).hexdigest(),
+            "draft_processor": recipe.data.vlm_processor,
+            "max_length": training_args.training_seq_len,
+            "top_k": recipe.external.external_top_k,
+            "top_p": recipe.external.external_top_p,
+            "chat_template": Path(recipe.data.chat_template).read_text()
+            if recipe.data.chat_template
+            else None,
+            "visual_env": {
+                key: value for key, value in os.environ.items() if key.startswith("VLM_")
+            },
+        }
+        manifest = Path(training_args.output_dir) / "online_data.json"
+        with training_args.main_process_first(local=False, desc="online input manifest"):
+            if manifest.exists():
+                if json.loads(manifest.read_text()) != fingerprint:
+                    raise ValueError(
+                        "Online input or scoring settings changed; use a fresh output directory."
+                    )
+            else:
+                manifest.parent.mkdir(parents=True, exist_ok=True)
+                temporary = manifest.with_suffix(".tmp")
+                temporary.write_text(json.dumps(fingerprint, indent=2) + "\n")
+                temporary.replace(manifest)
+        collator = OnlineMultimodalCollator(
+            recipe.model.model_name_or_path,
+            recipe.data.vlm_processor,
+            tokenizer,
+            training_args.training_seq_len,
+            chat_template=Path(recipe.data.chat_template).read_text()
+            if recipe.data.chat_template
+            else None,
+        )
+        data_module = {"train_dataset": dataset, "data_collator": collator}
+    else:
+        data_module = make_speculative_data_module(
+            tokenizer,
+            recipe.data,
+            train_len=training_args.training_seq_len,
+            answer_only_loss=training_args.answer_only_loss,
+            shift_labels=not is_dflash,
+            final_aux_is_base_hidden=recipe.data.final_aux_is_base_hidden,
+            # The external draft never reads the aux planes, so it can consume dumps
+            # written with --no-aux-hidden-states. Every other mode must still fail
+            # loudly on a dump that omits them.
+            aux_hidden_states_optional=isinstance(recipe, ModelOptExternalDraftRecipe),
+        )
+
     if recipe.data.mode == "sparse" and recipe.external.external_loss == "tvd_deploy":
         # tvd_deploy filters the draft side by external_top_k, while the teacher side is
         # whatever the producer baked into the dump. If the two disagree the objective
@@ -559,11 +625,26 @@ def train():
     # Tell the draft model the CP degree so it skips the dense eagle mask under CP.
     model.eagle_cp_size = training_args.cp_size
 
-    trainer = EagleTrainerWithAccLog(
+    trainer_cls = OnlineExternalDraftTrainer if online_external else EagleTrainerWithAccLog
+    teacher_kwargs = (
+        {
+            "teacher": online_teacher,
+            "top_k": recipe.external.external_top_k,
+            "top_p": recipe.external.external_top_p,
+        }
+        if online_external
+        else {}
+    )
+    trainer = trainer_cls(
         model=model,
-        processing_class=tokenizer,
+        processing_class=(
+            data_module["data_collator"].processor
+            if isinstance(recipe, ModelOptExternalDraftRecipe) and recipe.data.vlm_processor
+            else tokenizer
+        ),
         args=training_args,
         callbacks=callbacks,
+        **teacher_kwargs,
         **data_module,
     )
 

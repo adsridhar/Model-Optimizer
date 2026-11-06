@@ -252,6 +252,243 @@ torchrun --nproc_per_node 8 main.py \
 > **Note on the learning rate:** we recommend sweeping to find the best rate for your own
 > draft and target.
 
+## Cosmos3 Super → vision-capable Qwen3.5-0.8B
+
+The initial multimodal path supports one final assistant turn per conversation,
+DDP (no FSDP/DeepSpeed), and sparse policies collected offline or computed online. Both models process the
+original media through their own vision stacks. Qwen's vision encoder is frozen; its `visual.merger`,
+language model, embeddings and output head train. Media files are referenced, not
+copied into the policy cache.
+
+The environment must support Qwen3.5 and have a working Transformers video decoder.
+Check a real video before collection; newer torchvision versions without
+`read_video` need a working TorchCodec installation.
+
+Run from the repository root. Collect each source into a separate directory:
+
+```bash
+torchrun --standalone --nproc_per_node=2 \
+  examples/speculative_decoding/collect_hidden_states/compute_sparse_policy_hf.py \
+  --model ../models/cosmos3-super-reasoner_vbf16-final \
+  --input-data ../../scratch.adsridhar_other_1/cosmos3_super_dflash_train_full_8192_partial.jsonl \
+  --output-dir ../../scratch.adsridhar_other_1/external_draft/cosmos3/policy \
+  --multimodal --draft-processor Qwen/Qwen3.5-0.8B \
+  --max-seq-len 16384 --top-k 20 --top-p 0.95 --answer-only-loss
+```
+
+Under `torchrun`, `RANK` and `WORLD_SIZE` select disjoint input partitions and
+`LOCAL_RANK` pins each full teacher replica to its GPU. Explicit `--dp-rank` and
+`--dp-world-size` override the partition defaults. The debug conversation limit
+applies to examined records per worker: `--debug-max-num-conversations 1` tries
+two examples with two workers; over-length examples can still be skipped.
+Direct `python` invocation remains a single worker with automatic
+model placement.
+
+Teacher scoring accepts `--batch-size N` per GPU (default 1). Processed
+conversations are right-padded, while each saved policy retains its own unpadded
+prompt, response, and media references. Different response positions are aligned
+before extracting top-k probabilities. A final smaller batch is also scored.
+This option is currently supported only with `--multimodal`.
+
+For Slurm, set `BATCH_SIZE`, for example:
+
+```bash
+BATCH_SIZE=2 bash examples/speculative_decoding/scripts/submit_external_policy_gen.sh --dry-run cosmos3
+```
+
+Profile before increasing it: long video sequences can be faster at batch size 1.
+A real H200 smoke at roughly 12,500 tokens used about 65.5 / 69.1 / 76.1 GiB peak
+allocated GPU memory at batch sizes 1 / 2 / 4 respectively. These are small-sample
+measurements, not worst-case bounds for the full dataset. Batched BF16 kernels can
+slightly change probabilities and near-tied top-k choices relative to single-record
+scoring.
+
+Structured image/video messages and LLaVA's `<image>` plus `images` format are
+accepted. `<image>` is a media placeholder only when image paths are declared;
+text-only HTML/XML examples retain literal `<image>` strings. Both processors honor per-record video `fps`; videos within one example
+must use the same rate. Collection checks processed lengths for both models and skips examples
+above the limit. It verifies identical response tokens before scoring the teacher.
+ChatML assistant boundaries provide the response mask, including reasoning text.
+Custom templates must preserve those boundaries. Keep visual preprocessing settings
+(including `VLM_MIN_PIXELS` / `VLM_MAX_PIXELS`) identical between collection and
+training; do not enable text-truncation environment variables.
+
+For full collection on the reference H200 Slurm configuration, use the submission
+wrapper. It scores existing responses; it does not generate new responses:
+
+```bash
+bash examples/speculative_decoding/scripts/submit_external_policy_gen.sh --dry-run both
+# Submit Cosmos3 first, then queue LLaVA after successful completion:
+bash examples/speculative_decoding/scripts/submit_external_policy_gen.sh both
+```
+
+The defaults match `../Model-Optimizer/examples/llm_distill/cosmos3_tvd/`:
+one node with eight H200s, the same partition list and exclusions, `batch-short`,
+and a four-hour limit per array task. At most one node runs at once. Cosmos3 uses
+128 array tasks and LLaVA uses 16; each task runs eight independent teacher
+replicas through `torchrun`. `GEN_PARTITION_GROUPS` overrides the number of array
+tasks; use more, smaller partitions if a task exceeds the time limit.
+Partition sizing has not been validated by a full-duration run.
+
+Outputs default to `../../scratch.adsridhar_other_1/external_draft`:
+
+- `<dataset>/policy/part-*/`: completed partitions, consumed recursively by cache creation.
+- `<dataset>/staging/`: active partitions, excluded from training.
+- `<dataset>/incomplete/`: preserved interrupted attempts, excluded from training.
+- `logs/<dataset>/<array-job>_<task>.out`: Slurm output; each partition also has `worker.log`.
+
+Each worker reports percentage, ETA, and written/skipped/invalid counts every
+30 seconds. Counts measure examined inputs; over-length examples are skipped.
+A `policy/part-*/.complete` marker records completion. Resubmitting the same
+command skips completed partitions and restarts interrupted partitions from their
+beginning. An interrupted partition has no per-record resume. When using `both`,
+a failed Cosmos3 array prevents its dependent LLaVA array from starting; resolve
+the failure and submit the missing stages again.
+
+The wrapper records input size/mtime, processor, scoring settings, and environment
+versions in `<dataset>/run.json`. Keep the source JSONL and media fixed during
+collection. Changed settings or input require a fresh `OUTPUT_ROOT`; do not mix
+manual exports into a managed output directory. `--dry-run` counts source records
+and previews submission without writing artifacts or submitting jobs. The worker
+uses the repository `scripts/activate_external_draft.sh` environment.
+
+Prebuild the cache as described above, then train:
+
+```bash
+torchrun --nproc_per_node 8 examples/speculative_decoding/main.py \
+  --config examples/speculative_decoding/recipes/cosmos3_super_qwen35_external.yaml
+```
+
+The recipe swaps Qwen onto Cosmos3's vocabulary and remaps visual special-token
+ids. Each teacher response offset is mapped to Qwen's own response position, so
+different visual-token counts do not shift the loss. Training refuses a response
+token mismatch or an oversized draft sequence rather than silently truncating it.
+The checkpoint includes Qwen's visual processors and the shared target tokenizer.
+
+`training.per_device_train_batch_size` controls the number of examples per GPU.
+Variable-length examples are padded to the longest sequence in that batch, and
+each response keeps its own teacher-policy alignment. Effective batch size is
+per-device batch × GPU count × gradient accumulation steps; profile memory at the
+intended sequence length and visual caps before increasing it.
+The recipe uses batch size 2 with non-reentrant gradient checkpointing for long
+sequences and a 16,384-token sequence limit, matching policy collection. With two
+GPUs and two accumulation steps, its effective batch is 8. Use
+`max_length=16384` when prebuilding its sparse cache.
+
+For stage 2, collect policies from
+`../LlamaFactory/data/llava_instruct_gqa_sft.jsonl` into a separate directory, then
+override `draft_model_name_or_path` and `data.vlm_processor` with the stage-1 output,
+set the stage-2 policy/cache paths, and choose a fresh `training.output_dir`.
+This starts a new optimizer schedule from the trained draft weights.
+
+A real teacher-policy batch has passed a draft backward step with production
+visual defaults. Multimodal acceptance, serving compatibility, and full-run
+stability still need validation. The existing grafted-head
+AR validation script does not validate a separate target/draft pair.
+
+## Online Cosmos3 Super → Qwen3.5 training
+
+The online recipe reads the original JSONL and scores the frozen Cosmos3 teacher
+before each draft forward. No teacher-policy files or sparse cache are created.
+The teacher and draft use their own visual processors; assistant token IDs are
+checked and response positions aligned before the existing sparse loss runs.
+Only the draft participates in DDP, optimization, and checkpoint saves. Its vision
+encoder stays frozen while `visual.merger` and the language model train.
+
+```bash
+source examples/speculative_decoding/scripts/activate_external_draft.sh
+torchrun --standalone --nproc_per_node=8 examples/speculative_decoding/main.py \
+  --config examples/speculative_decoding/recipes/cosmos3_super_qwen35_external_online.yaml
+```
+
+For the same H200 partitions as policy collection, submit an explicit `afterany` chain:
+
+```bash
+bash examples/speculative_decoding/scripts/submit_external_online.sh \
+  --runs 5 --nodes 1 --num-gpus 8 \
+  --output-dir ../../scratch.adsridhar_other_1/external_draft/qwen3.5-cosmos3-super \
+  --save-steps 250
+```
+
+The submitter queues all requested jobs immediately, each dependent on termination
+of its predecessor with `afterany`, matching the neighboring Model-Optimizer runner.
+A failure or timeout does not stop later jobs from attempting checkpoint resume.
+Each allocation has a four-hour limit and explicitly requests all node host RAM
+(`--mem=0`); the previous CPU-derived RAM allocation was insufficient for eight
+online teacher/draft workers. All job IDs are printed; cancel all remaining IDs
+to stop the chain. After successful training and final export, a small
+`.training-complete` marker makes remaining jobs exit without loading models.
+Remove that marker only when intentionally extending a completed run in place.
+
+`--runs`, `--num-gpus`, and `--output-dir` are required. `--nodes` defaults to one,
+and `--num-gpus` means GPUs per node. Checkpoint retention is five. `--save-steps`
+defaults to **250** and is honored after resume. Checkpoints and Slurm logs use
+`--output-dir`, with logs under `logs/<job-id>.out`. `--dry-run` previews the whole
+chain without submitting or writing artifacts. Stop any local training using the
+same output directory before submitting.
+
+For two nodes, one `srun` task on each node starts a torchrun agent. Agents share
+one rendezvous endpoint; only the batch coordinator acquires the output lock.
+Manifest creation uses global, rather than node-local, rank ordering. Each GPU
+still holds a complete teacher and draft, with DDP synchronizing draft gradients.
+The Python environment, source JSONL, all media, and checkpoints must be accessible
+at the same paths on both nodes. NCCL and two real teacher/draft optimizer steps
+passed on two physical H200 nodes with one GPU per node, without saving model
+checkpoints. Train/resume also passed with two independent one-GPU agents on one
+host; full sixteen-GPU throughput has not been measured.
+
+```bash
+bash examples/speculative_decoding/scripts/submit_external_online.sh \
+  --runs 5 --nodes 2 --num-gpus 8 \
+  --output-dir ../../scratch.adsridhar_other_1/external_draft/qwen3.5-cosmos3-super \
+  --save-steps 250 \
+  training.gradient_accumulation_steps=4
+```
+
+Two nodes x eight GPUs x batch 1 x accumulation 4 keeps the same global batch 64
+as one node x eight GPUs x accumulation 8. Keep that global batch when resuming
+checkpoint 1000 so the optimizer-step/data-offset mapping remains consistent.
+Changing world size is not bitwise reproducible, and new ranks have no matching
+saved per-rank RNG state. Additional recipe overrides can follow the submitter
+options. A single allocation is also available through
+`sbatch examples/speculative_decoding/scripts/train_external_online.sbatch`.
+
+The shared activation script defaults `CUDA_HOME` to the validated public CUDA
+13.3.1 toolkit at
+`/home/scratch.svc_compute_arch/release/cuda_toolkit/public/13.3.1/x86_64/u24.04`
+and adds its compiler to `PATH`. Set `EXTERNAL_DRAFT_CUDA_HOME` before sourcing
+activation to select another toolkit. This replaces inherited `CUDA_HOME` values,
+including malformed ones; selecting a compiler does not install optional FLA or
+causal-convolution kernels.
+
+Start with batch size 1 per GPU and gradient checkpointing. The recipe uses eight
+accumulation steps, for an effective batch of 64 with eight GPUs. Each GPU holds
+one full frozen teacher plus one draft; measure combined memory before increasing
+batch size. Teacher scoring is repeated each epoch.
+
+The loader builds an in-memory byte-offset index of one JSONL file, preserving
+heterogeneous message/media structures without copying the dataset. Files and
+media must remain fixed throughout training. `online_data.json` records the source
+size/mtime, teacher configuration, processors, and scoring settings. A changed
+manifest refuses reuse of the output directory. Normal Trainer checkpoint resume
+restores the optimizer/scheduler/RNG and skips consumed dataset indices; the teacher
+is reloaded from its original checkpoint. The first dataset is indexed again on
+startup, including resume.
+
+Examples exceeding 16,384 processed tokens for either model contribute no loss.
+An entirely filtered local batch uses a tiny zero-loss draft forward/backward so
+DDP ranks issue matching collectives. When an entire accumulation window is filtered
+across all ranks, parameters are not updated; the training step and learning-rate
+schedule still advance. `online_skipped_local` reports filtered records per rank
+since process startup. Malformed media or response-token mismatches fail loudly.
+
+For stage 2, set `data.data_path=../LlamaFactory/data/llava_instruct_gqa_sft.jsonl`,
+`draft_model_name_or_path` and `data.vlm_processor` to the stage-1 output, and choose
+a fresh `training.output_dir`. The fixed teacher remains Cosmos3 Super. Online
+support initially covers this pair, DDP, and the existing sparse losses
+(`tvd`, `tvd_deploy`, `tvd_ce`); full-distribution distillation and remote teachers
+are outside this path.
+
 ## Open Items
 
 ### Validated end-to-end
@@ -269,5 +506,4 @@ torchrun --nproc_per_node 8 main.py \
 ### Not yet validated
 
 - Streaming the teacher data from a live `vllm serve`. It is accepted for this mode but has
-  not been exercised. Online training is rejected outright, since it produces no cached
-  target outputs for the draft to be scored against.
+  not been exercised. The Cosmos3/Qwen3.5 pair has a separate local online path above.

@@ -51,7 +51,11 @@ def _retarget_special_tokens(draft, base_tokenizer):
         new_id = base_tokenizer.convert_tokens_to_ids(token)
         if new_id is None or (attr != "unk_token" and unk_id is not None and new_id == unk_id):
             continue
-        for target in (draft.config, getattr(draft, "generation_config", None)):
+        for target in (
+            draft.config,
+            draft.config.get_text_config(),
+            getattr(draft, "generation_config", None),
+        ):
             if target is not None and hasattr(target, f"{attr}_id"):
                 setattr(target, f"{attr}_id", new_id)
 

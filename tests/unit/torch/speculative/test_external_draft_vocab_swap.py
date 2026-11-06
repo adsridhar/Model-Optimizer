@@ -17,6 +17,7 @@
 
 import pytest
 import torch
+from _test_utils.torch.transformers_models import get_tiny_qwen3_5_vl_offline
 
 from modelopt.torch.speculative.external.vocab_swap import swap_draft_vocabulary
 
@@ -56,21 +57,33 @@ def _causal_lm(hidden=HIDDEN, vocab_size=64):
     return transformers.LlamaForCausalLM(cfg)
 
 
-def test_vocab_swap_carries_over_matching_tokens_and_reports_coverage():
+@pytest.mark.parametrize("multimodal", [False, True])
+def test_vocab_swap_carries_over_matching_tokens_and_reports_coverage(multimodal):
     """Rows for tokens both tokenizers spell the same must survive the swap, and the
     frequent-id coverage is the number worth looking at."""
-    draft = _causal_lm(hidden=HIDDEN, vocab_size=8)
+    draft = (
+        get_tiny_qwen3_5_vl_offline(vocab_size=8)
+        if multimodal
+        else _causal_lm(hidden=HIDDEN, vocab_size=8)
+    )
+    if multimodal:
+        draft.config.tie_word_embeddings = True
+        draft.config.text_config.tie_word_embeddings = True
+        draft.tie_weights()
     before = draft.get_input_embeddings().weight.data.clone()
     stats = swap_draft_vocabulary(
         draft,
         _FakeTok({"a": 0, "b": 1, "c": 2, "zz": 7}),
-        _FakeTok({"c": 0, "a": 1, "q": 2, "b": 3}),
+        _FakeTok({"c": 0, "a": 1, "q": 2, "b": 3}, specials={"eos_token": "b"}),
         4,
     )
 
     assert stats["matched"] == 3  # a, b, c; 'q' has no draft row
     assert stats["frequent_coverage"] == 0.75
-    assert draft.config.vocab_size == 4
+    assert draft.config.get_text_config().vocab_size == 4
+    assert draft.config.get_text_config().eos_token_id == 3
+    if multimodal:
+        assert draft.get_input_embeddings().weight is draft.get_output_embeddings().weight
     after = draft.get_input_embeddings().weight.data
     assert torch.allclose(after[0], before[2])  # base 'c' <- draft id 2
     assert torch.allclose(after[1], before[0])  # base 'a' <- draft id 0

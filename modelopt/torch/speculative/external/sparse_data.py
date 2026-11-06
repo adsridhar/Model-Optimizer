@@ -161,16 +161,18 @@ def _build_cache(cache: Path, files: list[str], top_k: int | None) -> None:
     cache.parent.mkdir(parents=True, exist_ok=True)
     tmp = Path(tempfile.mkdtemp(prefix=cache.name + ".tmp.", dir=cache.parent))
     try:
-        index: list[tuple[int, int, int, int]] = []
+        index: list[tuple[int, ...]] = []
         srcs: list[str] = []
         n_ids = n_pos = dropped = 0
         mass_sum = mass_n = 0.0
         width = top_k
+        multimodal = None
         damaged: list[tuple[str, str]] = []
         with (
             open(tmp / "ids.i32", "wb") as f_ids,
             open(tmp / "tok.i32", "wb") as f_tok,
             open(tmp / "prob.f16", "wb") as f_prob,
+            open(tmp / "messages.jsonl", "wb") as f_messages,
         ):
             for path in files:
                 opener = gzip.open if str(path).endswith(".gz") else open
@@ -275,7 +277,17 @@ def _build_cache(cache: Path, files: list[str], top_k: int | None) -> None:
                         f_ids.write(ids.tobytes())
                         f_tok.write(tok.tobytes())
                         f_prob.write(prob.tobytes())
-                        index.append((n_ids, len(prompt), n_gen, n_pos))
+                        has_messages = "messages" in r
+                        if multimodal is None:
+                            multimodal = has_messages
+                        if multimodal != has_messages:
+                            raise ValueError("Cannot mix text and multimodal policy records.")
+                        row: tuple[int, ...] = (n_ids, len(prompt), n_gen, n_pos)
+                        if multimodal:
+                            offset = f_messages.tell()
+                            f_messages.write((json.dumps(r["messages"]) + "\n").encode())
+                            row += (offset,)
+                        index.append(row)
                         srcs.append(r.get("source") or "")
                         n_ids += ids.shape[0]
                         n_pos += n_gen
@@ -447,7 +459,9 @@ class SparsePolicyDataset(torch.utils.data.Dataset):
         # run look larger than it is. Counted before any oversampling, so the number
         # describes the corpus the advice below asks the user to re-dump, not the
         # repeated index entries. Rank 0 only: every rank builds this object.
-        n_dead = int((self.index[:, 1] >= self.max_length).sum())
+        self.multimodal = self.index.shape[1] == 5
+        self._messages_path = cache / "messages.jsonl"
+        n_dead = 0 if self.multimodal else int((self.index[:, 1] >= self.max_length).sum())
         if n_dead:
             warn_rank_0(
                 f"{n_dead} of {self.index.shape[0]} sparse-policy records have a context of "
@@ -510,7 +524,23 @@ class SparsePolicyDataset(torch.utils.data.Dataset):
         return self.index.shape[0]
 
     def __getitem__(self, i):
-        ids_start, n_prompt, n_gen, pos_start = (int(x) for x in self.index[i])
+        ids_start, n_prompt, n_gen, pos_start = (int(x) for x in self.index[i][:4])
+        if self.multimodal:
+            with open(self._messages_path, "rb") as stream:
+                stream.seek(int(self.index[i][4]))
+                messages = json.loads(stream.readline())
+            sl = slice(pos_start, pos_start + n_gen)
+            return {
+                "messages": messages,
+                "gen_ids": torch.from_numpy(
+                    np.array(
+                        self._ids[ids_start + n_prompt : ids_start + n_prompt + n_gen],
+                        dtype=np.int64,
+                    )
+                ),
+                "teacher_topk_tok": torch.from_numpy(np.array(self._tok[sl], dtype=np.int64)),
+                "teacher_topk_prob": torch.from_numpy(np.array(self._prob[sl], dtype=np.float32)),
+            }
         n = min(n_prompt + n_gen, self.max_length)
         input_ids = torch.from_numpy(
             np.asarray(self._ids[ids_start : ids_start + n], dtype=np.int64)
